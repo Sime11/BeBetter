@@ -1,0 +1,265 @@
+const express = require("express");
+const mysql = require("mysql");
+const cors = require("cors");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const cookieParser = require('cookie-parser');
+const util = require('util');
+
+const app = express();
+const port = 3000;
+
+// Middleware za CORS
+app.use(cors({
+  origin: 'http://localhost:9000',
+  credentials: true
+}));
+
+app.use(express.json());
+app.use(cookieParser());
+
+const JWT_SECRET = "bebetter-secret-key";
+
+// Middleware za provjeru JWT tokena
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Potrebna je autentikacija' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Neispravan token' });
+    }
+
+    req.user = user;
+    next();
+  });
+}
+
+// Middleware za provjeru admin privilegija
+function authenticateAdmin(req, res, next) {
+  if (req.user.uloga !== 'admin') {
+    return res.status(403).json({ error: 'Pristup dozvoljen samo administratorima' });
+  }
+  next();
+}
+
+// Kreiranje pool konekcije
+const pool = mysql.createPool({
+  host: "ucka.veleri.hr",
+  user: "sjuresko",
+  password: "11",
+  database: "sjuresko",
+  connectionLimit: 10,
+  queueLimit: 0,
+  waitForConnections: true,
+  connectTimeout: 60000,
+  acquireTimeout: 60000,
+  timeout: 60000
+});
+
+// Pretvaramo pool.query u promise verziju
+const query = util.promisify(pool.query).bind(pool);
+
+// Funkcija za kreiranje tablica
+async function createTables() {
+  try {
+    // Kreiraj tablice ako ne postoje
+    await query(`
+      CREATE TABLE IF NOT EXISTS Korisnici (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        email VARCHAR(255) NOT NULL UNIQUE,
+        password VARCHAR(255) NOT NULL,
+        uloga ENUM('korisnik', 'admin') DEFAULT 'korisnik'
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS KorisnickiProfil (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        korisnik_id INT NOT NULL,
+        ime VARCHAR(100),
+        prezime VARCHAR(100),
+        spol ENUM('M', 'Ž'),
+        datum_rodenja DATE,
+        visina DECIMAL(5,2),
+        tezina DECIMAL(5,2),
+        razina_aktivnosti ENUM('Početnik', 'Srednja razina', 'Napredni'),
+        zdravstveno_stanje TEXT,
+        fitness_ciljevi TEXT,
+        FOREIGN KEY (korisnik_id) REFERENCES Korisnici(id) ON DELETE CASCADE
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS DnevnikTreninga (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        korisnik_id INT NOT NULL,
+        tip_treninga VARCHAR(50) NOT NULL,
+        datum DATETIME NOT NULL,
+        trajanje INT NOT NULL,
+        tezina_treninga INT,
+        biljeske TEXT,
+        FOREIGN KEY (korisnik_id) REFERENCES Korisnici(id) ON DELETE CASCADE
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS ZavrseniTreninzi (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        trening_id INT,
+        korisnik_id INT,
+        tip_treninga VARCHAR(50),
+        datum DATETIME,
+        trajanje INT,
+        tezina_treninga INT,
+        biljeske TEXT,
+        vrijeme_zavrsetka DATETIME,
+        FOREIGN KEY (korisnik_id) REFERENCES Korisnici(id) ON DELETE CASCADE
+      )
+    `);
+
+    console.log('Tablice su uspješno kreirane');
+  } catch (error) {
+    console.error('Greška pri kreiranju tablica:', error);
+    throw error;
+  }
+}
+
+// Endpoint za završavanje treninga
+app.post('/api/dnevnik-treninga/:id/zavrsi', authenticateToken, async (req, res) => {
+  try {
+    const treningId = req.params.id;
+    const korisnikId = req.user.id;
+    
+    // Provjeri postoji li trening i pripada li korisniku
+    const [trening] = await query(
+      'SELECT * FROM DnevnikTreninga WHERE id = ? AND korisnik_id = ?',
+      [treningId, korisnikId]
+    );
+
+    if (!trening) {
+      return res.status(404).json({ error: 'Trening nije pronađen' });
+    }
+
+    const vrijeme_zavrsetka = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    
+    // Prebaci trening u završene treninge
+    await query(
+      `INSERT INTO ZavrseniTreninzi 
+       (trening_id, korisnik_id, tip_treninga, datum, trajanje, tezina_treninga, biljeske, vrijeme_zavrsetka)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [treningId, korisnikId, trening.tip_treninga, trening.datum, 
+       parseInt(trening.trajanje) || 0,
+       trening.tezina_treninga, trening.biljeske, vrijeme_zavrsetka]
+    );
+
+    // Obriši SAMO ovaj trening iz aktivnih treninga
+    await query(
+      'DELETE FROM DnevnikTreninga WHERE id = ? AND korisnik_id = ?', 
+      [treningId, korisnikId]
+    );
+
+    // Dohvati ažuriranu statistiku
+    const [statistika] = await query(
+      `SELECT 
+        COUNT(*) as ukupnoTreninga,
+        SUM(CASE WHEN YEARWEEK(datum, 1) = YEARWEEK(NOW(), 1) THEN 1 ELSE 0 END) as treninziTjedan,
+        AVG(CAST(trajanje AS SIGNED)) as prosjecnoTrajanje,
+        SUM(CAST(trajanje AS SIGNED)) as ukupnoMinuta
+      FROM ZavrseniTreninzi 
+      WHERE korisnik_id = ?`,
+      [korisnikId]
+    );
+
+    res.json({
+      message: 'Trening uspješno završen',
+      statistika: {
+        ukupnoTreninga: parseInt(statistika.ukupnoTreninga) || 0,
+        treninziTjedan: parseInt(statistika.treninziTjedan) || 0,
+        prosjecnoTrajanje: Math.round(parseFloat(statistika.prosjecnoTrajanje)) || 0,
+        ukupnoSati: Math.floor((parseInt(statistika.ukupnoMinuta) || 0) / 60)
+      }
+    });
+  } catch (error) {
+    console.error('Greška pri završavanju treninga:', error);
+    res.status(500).json({ error: 'Greška pri završavanju treninga' });
+  }
+});
+
+// Dohvaćanje završenih treninga
+app.get('/api/zavrseni-treninzi', authenticateToken, async (req, res) => {
+  try {
+    const korisnikId = req.user.id;
+    const treninzi = await query(
+      `SELECT id, trening_id, tip_treninga, datum, 
+              CAST(trajanje AS SIGNED) as trajanje, 
+              tezina_treninga, biljeske, vrijeme_zavrsetka
+       FROM ZavrseniTreninzi
+       WHERE korisnik_id = ?
+       ORDER BY vrijeme_zavrsetka DESC`,
+      [korisnikId]
+    );
+    
+    // Osiguraj da su brojevi ispravno formatirani
+    const formattedTreninzi = treninzi.map(t => ({
+      ...t,
+      trajanje: parseInt(t.trajanje) || 0,
+      tezina_treninga: parseInt(t.tezina_treninga) || 0
+    }));
+    
+    console.log('Dohvaćeni završeni treninzi:', formattedTreninzi);
+    res.json(formattedTreninzi);
+  } catch (error) {
+    console.error('Greška pri dohvaćanju završenih treninga:', error);
+    res.status(500).json({ error: 'Greška pri dohvaćanju završenih treninga' });
+  }
+});
+
+// Dohvaćanje statistike korisnika
+app.get('/api/statistika-korisnika', authenticateToken, async (req, res) => {
+  try {
+    const korisnikId = req.user.id;
+    
+    const [statistika] = await query(
+      `SELECT 
+        COUNT(*) as ukupnoTreninga,
+        SUM(CASE WHEN YEARWEEK(datum, 1) = YEARWEEK(NOW(), 1) THEN 1 ELSE 0 END) as treninziTjedan,
+        AVG(CAST(trajanje AS SIGNED)) as prosjecnoTrajanje,
+        SUM(CAST(trajanje AS SIGNED)) as ukupnoMinuta
+      FROM ZavrseniTreninzi 
+      WHERE korisnik_id = ?`,
+      [korisnikId]
+    );
+
+    res.json({
+      ukupnoTreninga: parseInt(statistika.ukupnoTreninga) || 0,
+      treninziTjedan: parseInt(statistika.treninziTjedan) || 0,
+      prosjecnoTrajanje: Math.round(parseFloat(statistika.prosjecnoTrajanje)) || 0,
+      ukupnoSati: Math.floor((parseInt(statistika.ukupnoMinuta) || 0) / 60)
+    });
+  } catch (error) {
+    console.error('Greška pri dohvaćanju statistike:', error);
+    res.status(500).json({ error: 'Greška pri dohvaćanju statistike' });
+  }
+});
+
+// Inicijalizacija servera
+async function startServer() {
+  try {
+    await query('SELECT 1');
+    await createTables();
+    
+    app.listen(port, () => {
+      console.log(`Server radi na http://localhost:${port}`);
+    });
+  } catch (error) {
+    console.error("Greška pri inicijalizaciji:", error);
+  }
+}
+
+// Pokreni server
+startServer();

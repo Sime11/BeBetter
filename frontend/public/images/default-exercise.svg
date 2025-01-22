@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="200" height="200" version="1.1" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+ <rect width="200" height="200" fill="#f0f0f0"/>
+ <g transform="matrix(1.3333 0 0 -1.3333 0 200)">
+  <path d="m75 75c0-13.807-11.193-25-25-25s-25 11.193-25 25 11.193 25 25 25 25-11.193 25-25zm-25 15c-8.284 0-15-6.716-15-15s6.716-15 15-15 15 6.716 15 15-6.716 15-15 15z" fill="#666"/>
+  <path d="m100 75h-10v-10h-10v20h20z" fill="#666"/>
+ </g>
+</svg>
